@@ -1,243 +1,175 @@
-# LLM-Driven Costmap Framework for Industrial AMRs
+# Large-Language-Model-Driven Costmap
 
-## Overview
+This repository contains the runtime implementation of the natural-language policy interface and its Nav2 costmap plugins. Paper evaluation datasets, benchmark runners, and result-generation scripts are intentionally excluded from this public runtime release.
 
-This module is designed for use with ROS 2 Humble and the Navigation2 stack.
+The interface converts an English operator command into a validated policy, publishes zone and object constraints to Nav2 costmap layers, and executes the requested waypoint mission. The GUI supports single-robot and namespaced multi-robot Nav2 systems.
 
-It has been tested in multi-AMR environments using ROS 2 Humble on Ubuntu 22.04 with standard Nav2 navigation behavior.
+Project page: https://anonymous10forpaper.github.io/Large-Language-Model-Driven-Costmap_Page/
 
-This framework converts natural-language commands into navigation policies and projects them onto Nav2 costmaps via custom layers. High-level policies can be shared across a fleet, while Nav2 planners handle path computation and execution.
+## Packages
 
-## 📦 Packages
+### `policy_bridge`
 
-This repository provides two ROS 2 packages for natural-language-driven navigation policies:
+- PyQt5 operator interface
+- Installed Ollama model discovery and selection
+- Natural-language policy generation
+- Policy schema and execution-constraint validation
+- FIFO mission queue, replacement, stop, resume, and cancel controls
+- Map YAML display with editable waypoints and policy zones
+- Single-robot and namespaced multi-robot missions
+- Optional camera-based person detection and object-aware costs
 
-- **policy_bridge**: A runtime policy conversion module that processes natural language commands and publishes costmap updates.
-- **my_costmap_layers**: Nav2 plugin layers that integrate policy-derived costs into the costmap.
+### `my_costmap_layers`
 
-## Package 1: policy_bridge
+- `KeepoutCommandLayer` for forbidden zones
+- `ZoneSoftCostLayer` for zone-specific costs
+- `ObjectAvoidanceLayer` for dynamic object clearance
+- Runtime zone geometry updates from the GUI
 
-### Overview
+## Platform
 
-`policy_bridge` implements a policy bridge node that converts natural-language commands into structured navigation policies.
+The reference environment uses Ubuntu 22.04, ROS 2 Humble, Nav2, and TurtleBot3. An Ollama-compatible local generate API is expected at `http://localhost:11434/api/generate` by default.
 
-### Features
+## Install
 
-- Natural language command processing via LLM
-- Policy validation and merging
-- Spatiotemporal constraint handling
-- Semantic object detection and localization
-- Multi-waypoint navigation
-- Multi-robot fleet support with shared policy topics
-
-### Nodes
-
-- `policybridge`: Single-robot policy bridge node
-- `policybridge_multi`: Multi-robot fleet policy bridge node
-- `nl_command_sender`: Command sender for natural language mission commands
-- `event_sender`: Event sender for state events (fire alarm, battery, etc.)
-
-### Build Instructions
+Place this repository inside a ROS 2 workspace and install the ROS dependencies.
 
 ```bash
-cd ~/your_ros2_ws/src
-git clone <this_repository>
-cd ~/your_ros2_ws
-colcon build --packages-select policy_bridge
+cd ~/turtlebot3_ws/src
+git clone https://github.com/anonymous10forpaper/Large-Language-Model-Driven-Costmap.git
+cd ~/turtlebot3_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --packages-select my_costmap_layers policy_bridge
 source install/setup.bash
 ```
 
-### Run Instructions
-
-**Single Robot:**
+Install PyTorch and Ultralytics when camera-based person detection is required.
 
 ```bash
-ros2 run policy_bridge policy_bridge
+python3 -m pip install torch ultralytics
 ```
 
-**Multi-Robot Fleet:**
+Install and start Ollama, then pull at least one supported model.
 
 ```bash
-ros2 run policy_bridge policy_bridge_multi
+ollama pull qwen3:8b
+ollama serve
 ```
 
-**Command Sender:**
+The GUI lists every model reported by the connected Ollama server. A different generate endpoint can be supplied as a ROS parameter.
 
-```bash
-ros2 run policy_bridge nl_command_sender
-```
+## Nav2 Configuration
 
-**Event Sender:**
-
-```bash
-ros2 run policy_bridge event_sender
-```
-
-## Package 2: my_costmap_layers
-
-### Overview
-
-`my_costmap_layers` implements three custom Nav2 costmap layers that integrate policy-derived costs with sensor-based costs. The layers subscribe to policy topics and update the costmap accordingly.
-
-### Features
-
-- Implements `nav2_costmap_2d::Layer` interface
-- Subscribes to policy topics (`/forbidden_zones_update`, `/zone_cost_overrides`, `/object_world_positions`)
-- Applies region-specific cost updates efficiently
-- Fully compatible with pluginlib
-
-### Layers
-
-1. **KeepoutCommandLayer**: Assigns lethal cost (254) to forbidden zones
-2. **ZoneSoftCostLayer**: Applies zone-specific differential costs (soft preferences)
-3. **ObjectAvoidanceLayer**: Generates disc-shaped costs around detected objects
-
-### Build Instructions
-
-```bash
-cd ~/your_ros2_ws/src
-git clone <this_repository>
-cd ~/your_ros2_ws
-colcon build --packages-select my_costmap_layers
-source install/setup.bash
-```
-
-### Plugin Configuration
-
-Add the following to your `nav2_params.yaml`:
+Add the three plugins to the global costmap. Keep the inflation layer after the policy layers so hard and soft costs participate in the final inflated costmap.
 
 ```yaml
 global_costmap:
-  ros__parameters:
-    plugins: ["static_layer", "obstacle_layer", "voxel_layer", "keepout_command_layer", "zone_softcost_layer", "object_avoidance_layer", "inflation_layer"]
-    keepout_command_layer:
-      plugin: "my_costmap_layers::KeepoutCommandLayer"
-      enabled: True
-      forbidden_zones_topic: "/forbidden_zones_update"        # multi-robot: use "/fleet/forbidden_zones_update"
-    object_avoidance_layer:
-      plugin: "my_costmap_layers::ObjectAvoidanceLayer"
-      enabled: True
-      object_positions_topic: "/object_world_positions"       # multi-robot: use "/fleet/object_world_positions"
-      avoidance_radius: 2.0
-      hold_after_clear_s: 0.6
-    zone_softcost_layer:
-      plugin: "my_costmap_layers::ZoneSoftCostLayer"
-      enabled: True
-      zone_cost_overrides_topic: "/zone_cost_overrides"       # multi-robot: use "/fleet/zone_cost_overrides"
+  global_costmap:
+    ros__parameters:
+      plugins:
+        - static_layer
+        - obstacle_layer
+        - keepout_command_layer
+        - zone_softcost_layer
+        - object_avoidance_layer
+        - inflation_layer
+
+      keepout_command_layer:
+        plugin: "my_costmap_layers::KeepoutCommandLayer"
+        enabled: true
+        forbidden_zones_topic: "/forbidden_zones_update"
+        zone_geometry_topic: "/zone_geometry_update"
+
+      zone_softcost_layer:
+        plugin: "my_costmap_layers::ZoneSoftCostLayer"
+        enabled: true
+        zone_cost_overrides_topic: "/zone_cost_overrides"
+        zone_geometry_topic: "/zone_geometry_update"
+
+      object_avoidance_layer:
+        plugin: "my_costmap_layers::ObjectAvoidanceLayer"
+        enabled: true
+        object_positions_topic: "/object_world_positions"
+        object_avoidance_radius_topic: "/object_avoidance_radius"
+        avoidance_radius: 1.5
+        hold_after_clear_s: 0.6
+        decay_ttl_s: 0.6
+        decay_step_s: 0.1
 ```
 
-## 📡 ROS Topics
+Restart Nav2 after adding the plugins. The GUI reports how many zone layers are connected.
 
-### Published Topics
+## Run
 
-- `/forbidden_zones_update` (std_msgs/String): JSON-encoded forbidden zone list
-- `/zone_cost_overrides` (std_msgs/String): JSON-encoded zone cost overrides
-- `/object_world_positions` (geometry_msgs/PoseArray): Detected object poses in world frame
-- `/fleet/forbidden_zones_update` (multi-robot): Fleet-wide forbidden zones
-- `/fleet/zone_cost_overrides` (multi-robot): Fleet-wide cost overrides
-- `/fleet/object_world_positions_json` (multi-robot): Fleet-wide object positions (JSON)
-
-### Subscribed Topics
-
-- `/nl_command` (std_msgs/String): Natural language commands
-- `/camera/image_raw` (sensor_msgs/Image): RGB camera stream (for YOLO)
-- `/camera/depth/image_raw` (sensor_msgs/Image): Depth image (for 3D object localization)
-- `/camera/camera_info` (sensor_msgs/CameraInfo): Camera intrinsics
-
-## Summary
-
-This system enables adaptive costmap updates in response to natural-language policy commands, supporting keepout zones, soft costs, temporal conditions, dynamic object avoidance, and multi-robot operation.
-
-## Folder Structure
-
-```
-.
-├── policy_bridge/
-│   ├── policy_bridge/
-│   │   ├── __init__.py
-│   │   ├── policybridge.py
-│   │   ├── policybridge_multi.py
-│   │   ├── nl_command_sender.py
-│   │   └── event_sender.py
-│   ├── resource/
-│   │   └── policy_bridge
-│   ├── setup.py
-│   ├── setup.cfg
-│   └── package.xml
-├── my_costmap_layers/
-│   ├── src/
-│   │   ├── KeepoutCommandLayer.cpp
-│   │   ├── ObjectAvoidanceLayer.cpp
-│   │   └── ZoneSoftCostLayer.cpp
-│   ├── include/
-│   │   └── my_costmap_layers/
-│   │       ├── keepout_command_layer.hpp
-│   │       ├── object_avoidance_layer.hpp
-│   │       └── zone_soft_cost_layer.hpp
-│   ├── plugins/
-│   │   └── costmap_plugins.xml
-│   ├── CMakeLists.txt
-│   └── package.xml
-```
-
-## 🔗 Dependencies
-
-### LLM Backend
-
-- HTTP-accessible LLM endpoint compatible with the Ollama-style generate API
-- Example (Ollama on Ubuntu):
-  - Install Ollama: see `https://ollama.com`
-  - Pull model: `ollama pull llama3.1`
-  - Ensure the service is listening on `http://localhost:11434` (default)
-- Configure `llm_endpoint` and `llm_model` parameters in your launch file
-
-### Python Packages (policy_bridge)
-
-- `torch`
-- `ultralytics` (YOLO)
-- `opencv-python` (for debugging and image handling)
-
-Install example:
+Start the robot simulation or hardware Nav2 stack, start Ollama, and launch the GUI.
 
 ```bash
-pip install torch ultralytics opencv-python
+source ~/turtlebot3_ws/install/setup.bash
+ros2 run policy_bridge policy_bridge_gui
 ```
 
-C++/ROS dependencies for `my_costmap_layers` follow the standard Nav2 costmap plugin requirements (see `package.xml` and `CMakeLists.txt`).
+To use another Ollama generate endpoint:
 
-## 🔧 Troubleshooting
+```bash
+ros2 run policy_bridge policy_bridge_gui --ros-args -p gui_llm_endpoint:=http://127.0.0.1:11434/api/generate
+```
 
-### LLM Not Responding
+## Map Setup
 
-- Check `llm_endpoint` parameter and network connectivity
-- Verify LLM service is running (e.g., Ollama)
+Open a ROS map YAML from **Map / Setup**. Waypoints can be placed by map click or entered in map-frame coordinates. Policy zones can be drawn as rectangles or entered as map bounds. Saving creates a map-specific sidecar named `<map_name>_waypoints.yaml` beside the selected map YAML.
 
-### Zones Not Appearing on Costmap
+The saved labels are immediately available to command interpretation, validation, waypoint execution, and both zone costmap layers.
 
-- Verify zone database JSON contains correct coordinates
-- Check that layer plugins are registered in costmap configuration
-- Ensure topics are being published (use `ros2 topic echo`)
+## Multi-Robot Setup
 
-### Objects Not Detected
+Each robot must expose a namespaced Nav2 action such as `/tb1/follow_waypoints`. The GUI discovers robot namespaces from active ROS graph endpoints and creates one mission panel per robot.
 
-- Verify YOLO model file exists and is accessible
-- Check that camera topics are correctly mapped to your actual RGB/Depth sensors
-- Ensure `enable_yolo` parameter is `true`
-- Note: the default topic names in this repository assume the Gazebo TurtleBot3 Waffle model with a RealSense D435; you may need to change them for your own camera setup.
+Use fleet-wide policy topics in every robot's global-costmap parameters when keepout and soft-cost policies must be shared:
 
-### Multi-Robot Policies Not Syncing
+```yaml
+keepout_command_layer:
+  plugin: "my_costmap_layers::KeepoutCommandLayer"
+  enabled: true
+  forbidden_zones_topic: "/fleet/forbidden_zones_update"
+  zone_geometry_topic: "/zone_geometry_update"
 
-- Verify all robots are on the same ROS 2 network
+zone_softcost_layer:
+  plugin: "my_costmap_layers::ZoneSoftCostLayer"
+  enabled: true
+  zone_cost_overrides_topic: "/fleet/zone_cost_overrides"
+  zone_geometry_topic: "/zone_geometry_update"
 
+object_avoidance_layer:
+  plugin: "my_costmap_layers::ObjectAvoidanceLayer"
+  enabled: true
+  object_positions_topic: "/fleet/object_world_positions"
+  object_avoidance_radius_topic: "/fleet/object_avoidance_radius"
+```
 
-## 📄 License
+Route goals remain robot-specific while accepted zone policies are published consistently across the fleet.
 
-This code is made available for academic purposes accompanying a manuscript submission to Robotics and Autonomous Systems.
+## Runtime Files
 
-Note: Unauthorized reproduction, distribution, or modification of this code is strictly prohibited.
+```text
+.
+├── policy_bridge
+│   ├── policy_bridge
+│   │   ├── gui_theme.py
+│   │   ├── policybridge.py
+│   │   ├── policybridge_gui.py
+│   │   ├── waypoint_map.py
+│   │   └── waypoint_map_gui.py
+│   ├── package.xml
+│   ├── setup.cfg
+│   └── setup.py
+└── my_costmap_layers
+    ├── include/my_costmap_layers
+    ├── plugins/costmap_plugins.xml
+    ├── src
+    ├── CMakeLists.txt
+    └── package.xml
+```
 
-© Anonymous Authors. All rights reserved.
+## License
 
-## 📧 Contact
-
-If you have questions regarding the paper or this framework, please refer to the official Robotics and Autonomous Systems submission.
+This runtime code accompanies an anonymous manuscript submission and is provided for academic review and reproducibility. All rights are reserved by the anonymous authors.

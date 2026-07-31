@@ -15,11 +15,7 @@ ZoneSoftCostLayer::ZoneSoftCostLayer()
 
 void ZoneSoftCostLayer::loadZoneDatabase()
 {
-  zone_db_["A"] = {8.01, -1.55, 23.96,  1.90};
-  zone_db_["B"] = {8.01, -6.05, 24.01, -2.60};
-  zone_db_["C"] = {8.01,-10.70, 24.06, -7.20};
-  zone_db_["D"] = {8.01, -15.2, 24.01, -11.70};
-  zone_db_["E"] = {8.01, -19.7, 24.01, -16.20};
+  zone_db_ = defaultZoneDatabase();
 }
 
 int ZoneSoftCostLayer::clampCost(int v)
@@ -41,9 +37,12 @@ void ZoneSoftCostLayer::onInitialize()
       node, name_ + ".zone_cost_overrides_topic", rclcpp::ParameterValue("/zone_cost_overrides"));
   nav2_util::declare_parameter_if_not_declared(
       node, name_ + ".enabled", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+      node, name_ + ".zone_geometry_topic", rclcpp::ParameterValue("/zone_geometry_update"));
 
   node->get_parameter(name_ + ".zone_cost_overrides_topic", topic_name_);
   node->get_parameter(name_ + ".enabled", enabled_);
+  node->get_parameter(name_ + ".zone_geometry_topic", zone_geometry_topic_name_);
 
   loadZoneDatabase();
   matchSize();
@@ -54,12 +53,78 @@ void ZoneSoftCostLayer::onInitialize()
   sub_ = node->create_subscription<std_msgs::msg::String>(
     topic_name_, qos,
     std::bind(&ZoneSoftCostLayer::costOverridesCallback, this, std::placeholders::_1));
+  zone_geometry_sub_ = node->create_subscription<std_msgs::msg::String>(
+    zone_geometry_topic_name_, qos,
+    std::bind(&ZoneSoftCostLayer::zoneGeometryCallback, this, std::placeholders::_1));
 
   current_ = true;
   updated_ = false;
 
   RCLCPP_INFO(rclcpp::get_logger("ZoneSoftCostLayer"),
               "ZoneSoftCostLayer listening on %s", topic_name_.c_str());
+}
+
+void ZoneSoftCostLayer::zoneGeometryCallback(
+  const std_msgs::msg::String::SharedPtr msg)
+{
+  std::unordered_map<std::string, Zone> parsed;
+  std::string error;
+  if (!parseZoneGeometry(msg->data, parsed, error)) {
+    RCLCPP_WARN(
+      rclcpp::get_logger("ZoneSoftCostLayer"),
+      "Rejected zone geometry: %s", error.c_str());
+    return;
+  }
+
+  std::lock_guard<Costmap2D::mutex_t> lock(*getMutex());
+  std::vector<std::string> active;
+  active.reserve(zone_costs_.size());
+  for (const auto & entry : zone_costs_) {
+    active.push_back(entry.first);
+  }
+
+  double old_min_x, old_min_y, old_max_x, old_max_y;
+  bool old_valid = false;
+  computeZonesUnion(
+    active, old_min_x, old_min_y, old_max_x, old_max_y, old_valid);
+
+  zone_db_.swap(parsed);
+
+  double new_min_x, new_min_y, new_max_x, new_max_y;
+  bool new_valid = false;
+  computeZonesUnion(
+    active, new_min_x, new_min_y, new_max_x, new_max_y, new_valid);
+  if (old_valid && new_valid) {
+    last_min_x_ = std::min(old_min_x, new_min_x);
+    last_min_y_ = std::min(old_min_y, new_min_y);
+    last_max_x_ = std::max(old_max_x, new_max_x);
+    last_max_y_ = std::max(old_max_y, new_max_y);
+  } else if (old_valid) {
+    last_min_x_ = old_min_x;
+    last_min_y_ = old_min_y;
+    last_max_x_ = old_max_x;
+    last_max_y_ = old_max_y;
+  } else if (new_valid) {
+    last_min_x_ = new_min_x;
+    last_min_y_ = new_min_y;
+    last_max_x_ = new_max_x;
+    last_max_y_ = new_max_y;
+  }
+  prev_valid_ = new_valid;
+  prev_min_x_ = new_min_x;
+  prev_min_y_ = new_min_y;
+  prev_max_x_ = new_max_x;
+  prev_max_y_ = new_max_y;
+  if (old_valid || new_valid) {
+    markFullMapForUpdate();
+  } else {
+    updated_ = false;
+    current_ = true;
+  }
+
+  RCLCPP_INFO(
+    rclcpp::get_logger("ZoneSoftCostLayer"),
+    "Updated runtime zone geometry (%zu zones).", zone_db_.size());
 }
 
 void ZoneSoftCostLayer::computeZonesUnion(const std::vector<std::string>& zones,
@@ -86,6 +151,16 @@ void ZoneSoftCostLayer::computeZonesUnion(const std::vector<std::string>& zones,
   if (!valid) {
     min_x = min_y = max_x = max_y = 0.0;
   }
+}
+
+void ZoneSoftCostLayer::markFullMapForUpdate()
+{
+  last_min_x_ = getOriginX();
+  last_min_y_ = getOriginY();
+  last_max_x_ = getOriginX() + getSizeInCellsX() * getResolution();
+  last_max_y_ = getOriginY() + getSizeInCellsY() * getResolution();
+  updated_ = true;
+  current_ = false;
 }
 
 void ZoneSoftCostLayer::costOverridesCallback(const std_msgs::msg::String::SharedPtr msg)
@@ -141,11 +216,21 @@ void ZoneSoftCostLayer::costOverridesCallback(const std_msgs::msg::String::Share
   double new_min_x, new_min_y, new_max_x, new_max_y; bool new_valid=false;
   computeZonesUnion(keys_now, new_min_x, new_min_y, new_max_x, new_max_y, new_valid);
 
-  if (prev_valid || new_valid) {
-    last_min_x_ = prev_valid ? std::min(prev_min_x, new_min_x) : new_min_x;
-    last_min_y_ = prev_valid ? std::min(prev_min_y, new_min_y) : new_min_y;
-    last_max_x_ = prev_valid ? std::max(prev_max_x, new_max_x) : new_max_x;
-    last_max_y_ = prev_valid ? std::max(prev_max_y, new_max_y) : new_max_y;
+  if (prev_valid && new_valid) {
+    last_min_x_ = std::min(prev_min_x, new_min_x);
+    last_min_y_ = std::min(prev_min_y, new_min_y);
+    last_max_x_ = std::max(prev_max_x, new_max_x);
+    last_max_y_ = std::max(prev_max_y, new_max_y);
+  } else if (prev_valid) {
+    last_min_x_ = prev_min_x;
+    last_min_y_ = prev_min_y;
+    last_max_x_ = prev_max_x;
+    last_max_y_ = prev_max_y;
+  } else if (new_valid) {
+    last_min_x_ = new_min_x;
+    last_min_y_ = new_min_y;
+    last_max_x_ = new_max_x;
+    last_max_y_ = new_max_y;
   } else {
     last_min_x_ = last_min_y_ = last_max_x_ = last_max_y_ = 0.0;
   }
@@ -154,8 +239,7 @@ void ZoneSoftCostLayer::costOverridesCallback(const std_msgs::msg::String::Share
   prev_min_x_ = new_min_x; prev_min_y_ = new_min_y;
   prev_max_x_ = new_max_x; prev_max_y_ = new_max_y;
 
-  updated_ = (prev_valid || new_valid);
-  current_ = false;
+  markFullMapForUpdate();
 
   RCLCPP_INFO(rclcpp::get_logger("ZoneSoftCostLayer"),
               "[PARSED] zones=%zu keys=%s",
@@ -286,4 +370,3 @@ void ZoneSoftCostLayer::reset()
 }
 
 PLUGINLIB_EXPORT_CLASS(my_costmap_layers::ZoneSoftCostLayer, nav2_costmap_2d::Layer)
-

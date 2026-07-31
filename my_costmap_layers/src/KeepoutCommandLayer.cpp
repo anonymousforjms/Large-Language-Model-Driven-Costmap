@@ -22,13 +22,7 @@ KeepoutCommandLayer::KeepoutCommandLayer()
 
 void KeepoutCommandLayer::loadZoneDatabase()
 {
-  zone_database_["A"] = {8.01, -1.55, 23.96, 1.90};
-  zone_database_["B"] = {8.01, -6.05, 24.01, -2.60};
-  zone_database_["C"] = {8.01, -10.70, 24.06, -7.20};
-  zone_database_["D"] = {8.01, -15.2, 24.01, -11.70};
-  zone_database_["E"] = {8.01, -19.7, 24.01, -16.20};
-  zone_database_["F"] = {24.00, -6.70, 28.00, -2.6};
-
+  zone_database_ = defaultZoneDatabase();
   RCLCPP_INFO(rclcpp::get_logger("KeepoutCommandLayer"),
               "Zone database loaded with %zu zones.", zone_database_.size());
 }
@@ -44,9 +38,12 @@ void KeepoutCommandLayer::onInitialize()
       node, name_ + ".forbidden_zones_topic", rclcpp::ParameterValue("/forbidden_zones_update"));
   nav2_util::declare_parameter_if_not_declared(
       node, name_ + ".enabled", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+      node, name_ + ".zone_geometry_topic", rclcpp::ParameterValue("/zone_geometry_update"));
 
   node->get_parameter(name_ + ".forbidden_zones_topic", forbidden_topic_name_);
   node->get_parameter(name_ + ".enabled", enabled_);
+  node->get_parameter(name_ + ".zone_geometry_topic", zone_geometry_topic_name_);
 
   loadZoneDatabase();
   matchSize();
@@ -56,9 +53,69 @@ void KeepoutCommandLayer::onInitialize()
   forbidden_zones_sub_ = node->create_subscription<std_msgs::msg::String>(
     forbidden_topic_name_, qos,
     std::bind(&KeepoutCommandLayer::forbiddenZonesCallback, this, std::placeholders::_1));
+  zone_geometry_sub_ = node->create_subscription<std_msgs::msg::String>(
+    zone_geometry_topic_name_, qos,
+    std::bind(&KeepoutCommandLayer::zoneGeometryCallback, this, std::placeholders::_1));
 
   current_ = true;
   updated_ = false;
+}
+
+void KeepoutCommandLayer::zoneGeometryCallback(
+  const std_msgs::msg::String::SharedPtr msg)
+{
+  std::unordered_map<std::string, Zone> parsed;
+  std::string error;
+  if (!parseZoneGeometry(msg->data, parsed, error)) {
+    RCLCPP_WARN(
+      rclcpp::get_logger("KeepoutCommandLayer"),
+      "Rejected zone geometry: %s", error.c_str());
+    return;
+  }
+
+  std::lock_guard<Costmap2D::mutex_t> lock(*getMutex());
+  double old_min_x, old_min_y, old_max_x, old_max_y;
+  bool old_valid = false;
+  computeZonesUnion(
+    forbidden_zones_, old_min_x, old_min_y, old_max_x, old_max_y, old_valid);
+
+  zone_database_.swap(parsed);
+
+  double new_min_x, new_min_y, new_max_x, new_max_y;
+  bool new_valid = false;
+  computeZonesUnion(
+    forbidden_zones_, new_min_x, new_min_y, new_max_x, new_max_y, new_valid);
+  if (old_valid && new_valid) {
+    last_min_x_ = std::min(old_min_x, new_min_x);
+    last_min_y_ = std::min(old_min_y, new_min_y);
+    last_max_x_ = std::max(old_max_x, new_max_x);
+    last_max_y_ = std::max(old_max_y, new_max_y);
+  } else if (old_valid) {
+    last_min_x_ = old_min_x;
+    last_min_y_ = old_min_y;
+    last_max_x_ = old_max_x;
+    last_max_y_ = old_max_y;
+  } else if (new_valid) {
+    last_min_x_ = new_min_x;
+    last_min_y_ = new_min_y;
+    last_max_x_ = new_max_x;
+    last_max_y_ = new_max_y;
+  }
+  prev_valid_ = new_valid;
+  prev_min_x_ = new_min_x;
+  prev_min_y_ = new_min_y;
+  prev_max_x_ = new_max_x;
+  prev_max_y_ = new_max_y;
+  if (old_valid || new_valid) {
+    markFullMapForUpdate();
+  } else {
+    updated_ = false;
+    current_ = true;
+  }
+
+  RCLCPP_INFO(
+    rclcpp::get_logger("KeepoutCommandLayer"),
+    "Updated runtime zone geometry (%zu zones).", zone_database_.size());
 }
 
 void KeepoutCommandLayer::computeZonesUnion(const std::vector<std::string>& zones,
@@ -88,6 +145,16 @@ void KeepoutCommandLayer::computeZonesUnion(const std::vector<std::string>& zone
   }
 }
 
+void KeepoutCommandLayer::markFullMapForUpdate()
+{
+  last_min_x_ = getOriginX();
+  last_min_y_ = getOriginY();
+  last_max_x_ = getOriginX() + getSizeInCellsX() * getResolution();
+  last_max_y_ = getOriginY() + getSizeInCellsY() * getResolution();
+  updated_ = true;
+  current_ = false;
+}
+
 void KeepoutCommandLayer::forbiddenZonesCallback(const std_msgs::msg::String::SharedPtr msg)
 {
   std::lock_guard<Costmap2D::mutex_t> lock(*getMutex());
@@ -108,11 +175,21 @@ void KeepoutCommandLayer::forbiddenZonesCallback(const std_msgs::msg::String::Sh
   double new_min_x, new_min_y, new_max_x, new_max_y; bool new_valid=false;
   computeZonesUnion(parsed, new_min_x, new_min_y, new_max_x, new_max_y, new_valid);
 
-  if (prev_valid_ || new_valid) {
-    last_min_x_ = prev_valid_ ? std::min(prev_min_x_, new_min_x) : new_min_x;
-    last_min_y_ = prev_valid_ ? std::min(prev_min_y_, new_min_y) : new_min_y;
-    last_max_x_ = prev_valid_ ? std::max(prev_max_x_, new_max_x) : new_max_x;
-    last_max_y_ = prev_valid_ ? std::max(prev_max_y_, new_max_y) : new_max_y;
+  if (prev_valid_ && new_valid) {
+    last_min_x_ = std::min(prev_min_x_, new_min_x);
+    last_min_y_ = std::min(prev_min_y_, new_min_y);
+    last_max_x_ = std::max(prev_max_x_, new_max_x);
+    last_max_y_ = std::max(prev_max_y_, new_max_y);
+  } else if (prev_valid_) {
+    last_min_x_ = prev_min_x_;
+    last_min_y_ = prev_min_y_;
+    last_max_x_ = prev_max_x_;
+    last_max_y_ = prev_max_y_;
+  } else if (new_valid) {
+    last_min_x_ = new_min_x;
+    last_min_y_ = new_min_y;
+    last_max_x_ = new_max_x;
+    last_max_y_ = new_max_y;
   } else {
     last_min_x_ = last_min_y_ = last_max_x_ = last_max_y_ = 0.0;
   }
@@ -123,8 +200,7 @@ void KeepoutCommandLayer::forbiddenZonesCallback(const std_msgs::msg::String::Sh
   prev_min_x_ = new_min_x; prev_min_y_ = new_min_y;
   prev_max_x_ = new_max_x; prev_max_y_ = new_max_y;
 
-  updated_ = true;
-  current_ = false;
+  markFullMapForUpdate();
 }
 
 void KeepoutCommandLayer::updateBounds(
@@ -238,4 +314,3 @@ void KeepoutCommandLayer::reset()
 }
 
 PLUGINLIB_EXPORT_CLASS(my_costmap_layers::KeepoutCommandLayer, nav2_costmap_2d::Layer)
-

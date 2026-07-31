@@ -9,10 +9,9 @@
 #include <vector>
 #include <string>
 #include <limits>
+#include "my_costmap_layers/ZoneGeometry.hpp"
 
 namespace my_costmap_layers {
-
-struct Zone { double x_min, y_min, x_max, y_max; };
 
 class KeepoutCommandLayer : public nav2_costmap_2d::CostmapLayer {
 public:
@@ -26,16 +25,20 @@ public:
 private:
   void loadZoneDatabase();
   void forbiddenZonesCallback(const std_msgs::msg::String::SharedPtr);
+  void zoneGeometryCallback(const std_msgs::msg::String::SharedPtr);
 
   void computeZonesUnion(const std::vector<std::string>& zones,
                          double& min_x, double& min_y, double& max_x, double& max_y,
                          bool& valid);
+  void markFullMapForUpdate();
 
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr forbidden_zones_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr zone_geometry_sub_;
   std::vector<std::string> forbidden_zones_;
   std::unordered_map<std::string, Zone> zone_database_;
- 
+
   std::string forbidden_topic_name_;
+  std::string zone_geometry_topic_name_;
 
   bool   updated_{false};
   double last_min_x_, last_min_y_, last_max_x_, last_max_y_;
@@ -45,4 +48,3 @@ private:
 };
 
 }
-

@@ -8,6 +8,7 @@
 #include <nav2_costmap_2d/costmap_2d.hpp>
 #include <nav2_costmap_2d/cost_values.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -27,8 +28,11 @@ public:
 
 private:
   void objectPositionsCallback(const geometry_msgs::msg::PoseArray::SharedPtr);
+  void avoidanceRadiusCallback(const std_msgs::msg::Float32::SharedPtr);
+  void clearLayerForRadiusChange();
 
   std::string object_topic_name_;
+  std::string radius_topic_name_;
   double avoidance_radius_{0.5};
   bool   enabled_{true};
   double bounds_padding_cells_{2.0};
@@ -55,6 +59,7 @@ private:
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr object_positions_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr avoidance_radius_sub_;
 
   inline size_t idx(unsigned int x, unsigned int y) const {
     return static_cast<size_t>(y) * getSizeInCellsX() + static_cast<size_t>(x);
@@ -66,4 +71,3 @@ private:
 };
 
 }
-

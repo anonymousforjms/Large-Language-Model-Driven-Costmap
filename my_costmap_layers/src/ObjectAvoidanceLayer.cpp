@@ -38,6 +38,8 @@ void ObjectAvoidanceLayer::onInitialize()
 
   nav2_util::declare_parameter_if_not_declared(node, name_ + ".object_positions_topic",
                                                rclcpp::ParameterValue("/object_world_positions"));
+  nav2_util::declare_parameter_if_not_declared(node, name_ + ".object_avoidance_radius_topic",
+                                               rclcpp::ParameterValue("/object_avoidance_radius"));
   nav2_util::declare_parameter_if_not_declared(node, name_ + ".avoidance_radius",        rclcpp::ParameterValue(0.5));
   nav2_util::declare_parameter_if_not_declared(node, name_ + ".enabled",                 rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(node, name_ + ".bounds_padding_cells",    rclcpp::ParameterValue(10.0));
@@ -46,6 +48,7 @@ void ObjectAvoidanceLayer::onInitialize()
   nav2_util::declare_parameter_if_not_declared(node, name_ + ".decay_step_s",            rclcpp::ParameterValue(0.1));
 
   node->get_parameter(name_ + ".object_positions_topic", object_topic_name_);
+  node->get_parameter(name_ + ".object_avoidance_radius_topic", radius_topic_name_);
   node->get_parameter(name_ + ".avoidance_radius",        avoidance_radius_);
   node->get_parameter(name_ + ".enabled",                 enabled_);
   node->get_parameter(name_ + ".bounds_padding_cells",    bounds_padding_cells_);
@@ -66,11 +69,66 @@ void ObjectAvoidanceLayer::onInitialize()
     object_topic_name_, qos,
     std::bind(&ObjectAvoidanceLayer::objectPositionsCallback, this, std::placeholders::_1));
 
+  rclcpp::QoS radius_qos(rclcpp::KeepLast(1));
+  radius_qos.reliable();
+  radius_qos.transient_local();
+  avoidance_radius_sub_ = node->create_subscription<std_msgs::msg::Float32>(
+    radius_topic_name_, radius_qos,
+    std::bind(&ObjectAvoidanceLayer::avoidanceRadiusCallback, this, std::placeholders::_1));
+
   current_ = true;
 
   RCLCPP_INFO(rclcpp::get_logger("ObjectAvoidanceLayer"),
-    "init: r=%.2f, topic='%s', hold=%.2fs, ttl=%.2fs/step=%.2fs, pad_cells=%.1f",
-    avoidance_radius_, object_topic_name_.c_str(), hold_after_clear_s_, decay_ttl_s_, decay_step_s_, bounds_padding_cells_);
+    "init: r=%.2f, object_topic='%s', radius_topic='%s', hold=%.2fs, ttl=%.2fs/step=%.2fs, pad_cells=%.1f",
+    avoidance_radius_, object_topic_name_.c_str(), radius_topic_name_.c_str(),
+    hold_after_clear_s_, decay_ttl_s_, decay_step_s_, bounds_padding_cells_);
+}
+
+void ObjectAvoidanceLayer::clearLayerForRadiusChange()
+{
+  for (unsigned int j = 0; j < getSizeInCellsY(); ++j) {
+    for (unsigned int i = 0; i < getSizeInCellsX(); ++i) {
+      setCost(i, j, nav2_costmap_2d::NO_INFORMATION);
+    }
+  }
+  ttl_grid_.assign(ttl_grid_.size(), 0.0f);
+
+  prev_valid_ = false;
+  prev_min_x_ = prev_min_y_ = prev_max_x_ = prev_max_y_ = 0.0;
+
+  last_min_x_ = getOriginX();
+  last_min_y_ = getOriginY();
+  last_max_x_ = getOriginX() + getSizeInCellsX() * getResolution();
+  last_max_y_ = getOriginY() + getSizeInCellsY() * getResolution();
+  updated_ = true;
+  current_ = false;
+}
+
+void ObjectAvoidanceLayer::avoidanceRadiusCallback(
+    const std_msgs::msg::Float32::SharedPtr msg)
+{
+  const double requested_radius = static_cast<double>(msg->data);
+  if (!std::isfinite(requested_radius) || requested_radius < 0.0 || requested_radius > 10.0) {
+    RCLCPP_WARN(rclcpp::get_logger("ObjectAvoidanceLayer"),
+      "Ignoring invalid dynamic avoidance radius %.3f m", requested_radius);
+    return;
+  }
+
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*getMutex());
+  if (std::fabs(requested_radius - avoidance_radius_) < 1e-6) return;
+
+  const double previous_radius = avoidance_radius_;
+  avoidance_radius_ = requested_radius;
+  clearLayerForRadiusChange();
+
+  if (avoidance_radius_ <= 0.0) {
+    detected_objects_.clear();
+    last_objects_cache_.clear();
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("ObjectAvoidanceLayer"),
+    "Dynamic avoidance radius updated: %.2f m -> %.2f m",
+    previous_radius, avoidance_radius_);
 }
 
 void ObjectAvoidanceLayer::ensureTtlGridSized()
@@ -150,12 +208,21 @@ void ObjectAvoidanceLayer::updateBounds(double, double, double,
   double* min_x, double* min_y, double* max_x, double* max_y)
 {
   if (!enabled_) return;
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*getMutex());
 
+  const bool had_live_ttl = std::any_of(
+    ttl_grid_.begin(), ttl_grid_.end(), [](float value) {return value > 0.0f;});
   if (auto node = node_.lock()) {
     const double dt = (last_decay_tick_.nanoseconds() == 0) ? 0.0
                      : (node->now() - last_decay_tick_).seconds();
     if (dt > 0.0) decayTtl(dt);
     last_decay_tick_ = node->now();
+  }
+  const bool has_live_ttl = std::any_of(
+    ttl_grid_.begin(), ttl_grid_.end(), [](float value) {return value > 0.0f;});
+  if (had_live_ttl && !has_live_ttl) {
+    updated_ = true;
+    current_ = false;
   }
 
   expandRoiToLiveTtl();
@@ -255,6 +322,13 @@ void ObjectAvoidanceLayer::objectPositionsCallback(
 
   updated_ = need_update;
   current_ = false;
+
+  if (auto node = node_.lock(); node && !detected_objects_.empty()) {
+    RCLCPP_INFO_THROTTLE(
+      node->get_logger(), *node->get_clock(), 2000,
+      "ObjectAvoidanceLayer received %zu map object(s), radius=%.2f m",
+      detected_objects_.size(), avoidance_radius_);
+  }
 }
 
 void ObjectAvoidanceLayer::updateCosts(nav2_costmap_2d::Costmap2D& master,
@@ -277,11 +351,13 @@ void ObjectAvoidanceLayer::updateCosts(nav2_costmap_2d::Costmap2D& master,
     s_printed_geo_warn.store(true, std::memory_order_relaxed);
   }
 
-  for (const auto& p : detected_objects_) {
-    unsigned int cx, cy;
-    if (!worldToMap(p.getX(), p.getY(), cx, cy)) continue;
-    const int r = std::max(1, (int)std::ceil(avoidance_radius_ / getResolution()));
-    stampDiskTtl(cx, cy, r);
+  if (avoidance_radius_ > 0.0) {
+    for (const auto& p : detected_objects_) {
+      unsigned int cx, cy;
+      if (!worldToMap(p.getX(), p.getY(), cx, cy)) continue;
+      const int r = std::max(1, (int)std::ceil(avoidance_radius_ / getResolution()));
+      stampDiskTtl(cx, cy, r);
+    }
   }
 
   const int lx = (int)getSizeInCellsX();
@@ -290,9 +366,9 @@ void ObjectAvoidanceLayer::updateCosts(nav2_costmap_2d::Costmap2D& master,
   for (int y = std::max(0, min_j); y < std::min(ly, max_j); ++y) {
     for (int x = std::max(0, min_i); x < std::min(lx, max_i); ++x) {
       if (ttl_grid_[idx(x,y)] > 0.f) {
-        const unsigned char prev = getCost(x, y);
-        const unsigned char cost = nav2_costmap_2d::LETHAL_OBSTACLE;
-        setCost(x, y, std::max(prev, cost));
+        setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+      } else if (getCost(x, y) == nav2_costmap_2d::LETHAL_OBSTACLE) {
+        setCost(x, y, nav2_costmap_2d::NO_INFORMATION);
       }
     }
   }
@@ -341,4 +417,3 @@ void ObjectAvoidanceLayer::reset()
 }
 
 PLUGINLIB_EXPORT_CLASS(my_costmap_layers::ObjectAvoidanceLayer, nav2_costmap_2d::Layer)
-

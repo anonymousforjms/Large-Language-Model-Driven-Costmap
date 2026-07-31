@@ -15,21 +15,23 @@ find_package(tf2 REQUIRED)
 find_package(nav2_util REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 include_directories(include)
 
-set(PLUGIN_SRCS 
+set(PLUGIN_SRCS
   src/KeepoutCommandLayer.cpp
   src/ObjectAvoidanceLayer.cpp
   src/ZoneSoftCostLayer.cpp
 )
 
 add_library(my_costmap_layers_library SHARED ${PLUGIN_SRCS})
+target_link_libraries(my_costmap_layers_library nlohmann_json::nlohmann_json)
 
-ament_target_dependencies(my_costmap_layers_library 
-  rclcpp 
-  nav2_costmap_2d 
-  pluginlib 
+ament_target_dependencies(my_costmap_layers_library
+  rclcpp
+  nav2_costmap_2d
+  pluginlib
   geometry_msgs
   std_msgs
   tf2
@@ -65,9 +67,10 @@ ament_export_dependencies(
   geometry_msgs
   std_msgs
   tf2
-  nav2_util 
+  nav2_util
   tf2_ros
   tf2_geometry_msgs
+  nlohmann_json
 )
 
 ament_package()
